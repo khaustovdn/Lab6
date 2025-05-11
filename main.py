@@ -1,375 +1,606 @@
-# region Imports
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import re
 import sys
+import time
 import logging
 import traceback
-from abc import ABC, abstractmethod
+from abc import abstractmethod
+from collections import defaultdict
+from dataclasses import dataclass
+from enum import Enum, auto
+from pathlib import Path
 from typing import (
     Any,
     Dict,
     List,
     Optional,
     Protocol,
-    Tuple,
-    TypeVar,
     runtime_checkable,
+    Callable,
+    DefaultDict,
 )
-from dataclasses import dataclass
-from pathlib import Path
-from enum import Enum
 
-from PySide6.QtCore import QObject, Signal, Slot
-from PySide6.QtGui import (
-    QAction,
-    QCloseEvent,
-    QColor,
-    QFont,
-    QTextCharFormat,
-    QTextCursor,
-)
+from PySide6.QtCore import QObject, Signal, Slot, QSettings
+from PySide6.QtGui import QAction, QColor, QTextCharFormat, QTextCursor, QPalette
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QHeaderView,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QSpinBox,
+    QTextEdit,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
-# endregion
 
-# region Core Types
-T = TypeVar("T")
-PathLike = TypeVar("PathLike", str, Path)
-
-
-class MatchType(Enum):
-    TIME = "time"
-    BITCOIN = "bitcoin"
-    COMMENT = "comment"
+# region Core Domain Types
 
 
 class LogLevel(Enum):
-    DEBUG = "DEBUG"
-    INFO = "INFO"
-    WARNING = "WARNING"
-    ERROR = "ERROR"
-# endregion
-
-# region Exceptions
-
-
-class ApplicationError(Exception):
-    """Base application exception"""
-
-
-class FileOperationError(ApplicationError):
-    """File system operations failure"""
-
-
-class AnalysisFailure(ApplicationError):
-    """Text analysis processing error"""
-
-
-# endregion
-
-# region Data Models
+    """Enumeration of log severity levels."""
+    DEBUG = auto()
+    INFO = auto()
+    WARNING = auto()
+    ERROR = auto()
+    CRITICAL = auto()
 
 
 @dataclass(frozen=True)
 class TextPosition:
+    """Immutable text position representation."""
     line: int
     column: int
     absolute: int
 
 
+class MatchType(Enum):
+    """Pattern match categories."""
+    TIME = auto()
+    BITCOIN = auto()
+    COMMENT = auto()
+
+
 @dataclass(frozen=True)
 class PatternMatch:
+    """Domain model for text pattern matches."""
     text: str
-    type: MatchType
+    kind: MatchType
     start: TextPosition
     end: TextPosition
 
 
 @dataclass(frozen=True)
+class AnalysisMetrics:
+    """Performance and statistical metrics."""
+    total_matches: int
+    processing_time: float
+
+
+@dataclass(frozen=True)
 class AnalysisResult:
+    """Result container for text analysis."""
     matches: List[PatternMatch]
-    metrics: Dict[str, Any]
-
+    metrics: AnalysisMetrics
 
 # endregion
 
-# region Protocols
+# region Exceptions
+
+
+class FileOperationError(Exception):
+    """Exception raised for file operation failures."""
+
+    def __init__(self, message: str, original: Optional[Exception] = None):
+        super().__init__(message)
+        self.original = original
+
+# endregion
+
+# region Application Interfaces
 
 
 @runtime_checkable
-class Logger(Protocol):
-    def log(
-        self,
-        level: LogLevel,
-        message: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
+class ILogger(Protocol):
+    """Abstract logging interface."""
+    @abstractmethod
+    def log(self, level: LogLevel, message: str, **metadata: Any) -> None:
         ...
 
 
 @runtime_checkable
-class FileHandler(Protocol):
+class IFileHandler(Protocol):
+    """Abstract file operations."""
+    @abstractmethod
     def read(self, path: Path) -> str:
         ...
 
+    @abstractmethod
     def write(self, path: Path, content: str) -> None:
         ...
 
 
 @runtime_checkable
-class TextAnalyzer(Protocol):
-    def analyze(self, text: str) -> AnalysisResult:
-        ...
-
-
-# endregion
-
-# region Service Layer
-
-
-class AdvancedLogger(Logger):
-    def __init__(self, handlers: Optional[List[logging.Handler]] = None):
-        self._logger = logging.getLogger(__name__)
-        self._logger.setLevel(logging.DEBUG)
-
-        if not handlers:
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter(
-                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-            )
-            handler.setFormatter(formatter)
-            handlers = [handler]
-
-        for h in handlers:
-            self._logger.addHandler(h)
-
-    def log(
-        self,
-        level: LogLevel,
-        message: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        log_method = {
-            LogLevel.DEBUG: self._logger.debug,
-            LogLevel.INFO: self._logger.info,
-            LogLevel.WARNING: self._logger.warning,
-            LogLevel.ERROR: self._logger.error,
-        }[level]
-
-        extra = {"metadata": metadata} if metadata else {}
-        log_method(message, extra=extra)
-
-
-class SecureFileHandler(FileHandler):
-    def __init__(self, logger: Logger):
-        self.logger = logger
-
-    def read(self, path: Path) -> str:
-        try:
-            with open(path, "r", encoding="utf-8", errors="strict") as f:
-                content = f.read()
-                self.logger.log(
-                    LogLevel.INFO,
-                    "File read successfully",
-                    {"path": str(path), "size": len(content)},
-                )
-                return content
-        except (IOError, UnicodeDecodeError) as e:
-            self.logger.log(
-                LogLevel.ERROR,
-                "File read failure",
-                {"path": str(path), "error": str(e)},
-            )
-            raise FileOperationError(f"Read error: {e}") from e
-
-    def write(self, path: Path, content: str) -> None:
-        try:
-            with open(path, "w", encoding="utf-8", errors="strict") as f:
-                f.write(content)
-                self.logger.log(
-                    LogLevel.INFO,
-                    "File write successful",
-                    {"path": str(path), "size": len(content)},
-                )
-        except (IOError, UnicodeEncodeError) as e:
-            self.logger.log(
-                LogLevel.ERROR,
-                "File write failure",
-                {"path": str(path), "error": str(e)},
-            )
-            raise FileOperationError(f"Write error: {e}") from e
-
-
-class BaseTextAnalyzer(TextAnalyzer, ABC):
+class ITextAnalyzer(Protocol):
+    """Text analysis contract."""
     @abstractmethod
     def analyze(self, text: str) -> AnalysisResult:
         ...
 
 
-class RegexAnalyzer(BaseTextAnalyzer):
-    PATTERNS = {
-        MatchType.TIME: re.compile(
-            r"\b(?:[01]\d|2[0-3]):(?:[0-5]\d):(?:[0-5]\d)\b"
-        ),
-        MatchType.BITCOIN: re.compile(
-            r"(?:[13][a-km-zA-HJ-NP-Z1-9]{25,34}|"
-            r"bc1[a-zA-HJ-NP-Z0-9]{25,90})"
-        ),
-        MatchType.COMMENT: re.compile(
-            r"(//.*?$|/\*.*?\*/)", re.MULTILINE | re.DOTALL
-        ),
-    }
+@runtime_checkable
+class ISettingsManager(Protocol):
+    """Configuration management interface."""
+    @abstractmethod
+    def get(self, section: str, key: str, default: Any = None) -> Any:
+        ...
 
-    def __init__(self, logger: Logger):
-        self.logger = logger
+    @abstractmethod
+    def set(self, section: str, key: str, value: Any) -> None:
+        ...
 
-    def analyze(self, text: str) -> AnalysisResult:
-        try:
-            matches = []
+    @abstractmethod
+    def register_handler(self, section: str, handler: Callable[[str, Any], None]) -> None:
+        ...
 
-            for match_type, pattern in self.PATTERNS.items():
-                for match in pattern.finditer(text):
-                    start = self._get_text_position(text, match.start())
-                    end = self._get_text_position(text, match.end())
-                    matches.append(
-                        PatternMatch(
-                            text=match.group(),
-                            type=match_type,
-                            start=start,
-                            end=end,
-                        )
-                    )
 
-            return AnalysisResult(
-                matches=sorted(matches, key=lambda m: m.start.absolute),
-                metrics={"match_count": len(matches)},
-            )
-        except Exception as e:
-            self.logger.log(
-                LogLevel.ERROR,
-                "Analysis failure",
-                {"error": str(e)},
-            )
-            raise AnalysisFailure("Analysis failed") from e
+class IView(Protocol):
+    """Abstract view interface."""
+    @abstractmethod
+    def display_results(self, result: AnalysisResult) -> None:
+        ...
 
-    @staticmethod
-    def _get_text_position(text: str, pos: int) -> TextPosition:
-        if pos < 0 or pos > len(text):
-            return TextPosition(1, 1, pos)
+    @abstractmethod
+    def set_content(self, text: str) -> None:
+        ...
 
-        lines = text[:pos].split("\n")
-        return TextPosition(
-            line=len(lines),
-            column=len(lines[-1]) + 1,
-            absolute=pos,
+    @abstractmethod
+    def show(self) -> None:
+        ...
+
+    @property
+    @abstractmethod
+    def content_changed(self) -> Signal:
+        ...
+
+    @property
+    @abstractmethod
+    def file_open_requested(self) -> Signal:
+        ...
+
+# endregion
+
+
+# region Theme Abstraction
+
+class ITheme(Protocol):
+    """Theme interface following Open/Closed principle"""
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        ...
+
+    @property
+    @abstractmethod
+    def colors(self) -> Dict[str, QColor]:
+        ...
+
+    @abstractmethod
+    def apply(self, app: QApplication) -> None:
+        ...
+
+    @abstractmethod
+    def get_stylesheet(self) -> str:
+        ...
+
+
+class ThemeManager(QObject):
+    """Centralized theme management (Single Responsibility)"""
+    theme_changed = Signal(ITheme)
+
+    def __init__(self, settings: ISettingsManager):
+        super().__init__()
+        self._settings = settings
+        self._themes: Dict[str, ITheme] = {}
+        self._current_theme: Optional[ITheme] = None
+
+    def register_theme(self, theme: ITheme) -> None:
+        """Open for extension through registration"""
+        self._themes[theme.name] = theme
+
+    def set_theme(self, theme_name: str) -> None:
+        """Set current theme using strategy pattern"""
+        if theme := self._themes.get(theme_name):
+            self._current_theme = theme
+            self._settings.set("ui", "theme", theme_name)
+            self.theme_changed.emit(theme)
+
+    def current_theme(self) -> ITheme:
+        """Liskov Substitution: Return any registered ITheme"""
+        return self._current_theme or next(iter(self._themes.values()))
+
+
+class CatppuccinDarkTheme(ITheme):
+    """Concrete Catppuccin theme implementation"""
+
+    def __init__(self):
+        self._colors = {
+            "base": QColor("#1E1E2E"),
+            "mantle": QColor("#181825"),
+            "text": QColor("#CDD6F4"),
+            "subtext": QColor("#BAC2DE"),
+            "blue": QColor("#89B4FA"),
+            "red": QColor("#F38BA8"),
+            "green": QColor("#A6E3A1"),
+            "yellow": QColor("#F9E2AF"),
+            "accent": QColor("#CBA6F7"),
+        }
+
+        self._stylesheet = f"""
+            QWidget {{
+                background-color: {self._colors["base"].name()};
+                color: {self._colors["text"].name()};
+                font-family: "Fira Code";
+            }}
+
+            QPlainTextEdit {{
+                background-color: {self._colors["mantle"].name()};
+                border: 1px solid {self._colors["accent"].name()};
+            }}
+
+            QTableWidget::item {{
+                selection-background-color: {self._colors["blue"].name()};
+            }}
+
+            /* Add more styled components here */
+        """
+
+    @property
+    def name(self) -> str:
+        return "catppuccin-dark"
+
+    @property
+    def colors(self) -> Dict[str, QColor]:
+        return self._colors
+
+    def apply(self, app: QApplication) -> None:
+        app.setStyle("Fusion")
+        app.setPalette(self._create_palette())
+        app.setStyleSheet(self._stylesheet)
+
+    def get_stylesheet(self) -> str:
+        return self._stylesheet
+
+    def _create_palette(self) -> QPalette:
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.Window, self._colors["base"])
+        palette.setColor(QPalette.ColorRole.WindowText, self._colors["text"])
+        palette.setColor(QPalette.ColorRole.Base, self._colors["mantle"])
+        return palette
+
+# endregion
+
+# region Infrastructure
+
+
+class StructuredLogger(ILogger):
+    """Production-grade structured logger."""
+
+    def __init__(self) -> None:
+        self._logger = logging.getLogger("TextAnalyzerPro")
+        self._configure_logging()
+
+    def _configure_logging(self) -> None:
+        """Initialize logging infrastructure."""
+        self._logger.setLevel(logging.DEBUG)
+        formatter = logging.Formatter(
+            "[%(asctime)s] [%(levelname)s] %(message)s || %(metadata)s"
         )
 
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        self._logger.addHandler(console_handler)
+
+    def log(self, level: LogLevel, message: str, **metadata: Any) -> None:
+        """Log structured message with metadata."""
+        log_level = self._convert_level(level)
+        self._logger.log(log_level, message, extra={"metadata": metadata or {}})
+
+    def _convert_level(self, level: LogLevel) -> int:
+        """Convert custom log level to standard."""
+        return {
+            LogLevel.DEBUG: logging.DEBUG,
+            LogLevel.INFO: logging.INFO,
+            LogLevel.WARNING: logging.WARNING,
+            LogLevel.ERROR: logging.ERROR,
+            LogLevel.CRITICAL: logging.CRITICAL,
+        }[level]
+
+
+class SecureFileHandler(IFileHandler):
+    """Secure file operations with validation."""
+
+    VALID_EXTENSIONS = {".txt", ".log", ".csv"}
+    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+    def __init__(self, logger: ILogger) -> None:
+        self._logger = logger
+
+    def read(self, path: Path) -> str:
+        """Safely read text file with validation."""
+        self._validate_path(path)
+        try:
+            content = path.read_text(encoding="utf-8", errors="strict")
+            self._logger.log(
+                LogLevel.INFO,
+                "File read successful",
+                path=str(path),
+                size=len(content)
+            )
+            return content
+        except Exception as e:
+            self._logger.log(
+                LogLevel.ERROR,
+                "File read failure",
+                error=str(e),
+                traceback=traceback.format_exc())
+            raise FileOperationError(f"Read failed: {e}", e) from e
+
+    def write(self, path: Path, content: str) -> None:
+        """Securely write content to file."""
+        self._validate_path(path)
+        try:
+            path.write_text(content, encoding="utf-8", errors="strict")
+            self._logger.log(
+                LogLevel.INFO,
+                "File write successful",
+                path=str(path),
+                size=len(content))
+        except Exception as e:
+            self._logger.log(
+                LogLevel.ERROR,
+                "File write failure",
+                error=str(e),
+                traceback=traceback.format_exc())
+            raise FileOperationError(f"Write failed: {e}", e) from e
+
+    def _validate_path(self, path: Path) -> None:
+        """Perform security and validation checks."""
+        if not path.exists():
+            raise FileNotFoundError(f"Path {path} does not exist")
+        if path.suffix not in self.VALID_EXTENSIONS:
+            raise ValueError(f"Invalid file extension: {path.suffix}")
+        if path.stat().st_size > self.MAX_FILE_SIZE:
+            raise ValueError("File size exceeds maximum allowed")
+
+# endregion
+
+# region Business Logic
+
+
+class RegexAnalyzer(ITextAnalyzer):
+    """Configurable regex-based text analyzer."""
+
+    DEFAULT_PATTERNS = {
+        "TIME": r"\b(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d\b",
+        "BITCOIN": r"(?:[13][A-KM-Za-km-z1-9]{25,34}|bc1[0-9A-Za-z]{25,90})",
+        "COMMENT": r"//.*?$|/\*.*?\*/",
+    }
+
+    def __init__(self, logger: ILogger, settings: ISettingsManager) -> None:
+        self._logger = logger
+        self._settings = settings
+        self._patterns: Dict[MatchType, re.Pattern] = {}
+        self._load_patterns()
+        settings.register_handler("patterns", self._on_patterns_changed)
+
+    def analyze(self, text: str) -> AnalysisResult:
+        """Perform text analysis with current patterns."""
+        start_time = time.perf_counter()
+        matches: List[PatternMatch] = []
+
+        for kind, pattern in self._patterns.items():
+            try:
+                for match in pattern.finditer(text):
+                    start = self._calculate_position(text, match.start())
+                    end = self._calculate_position(text, match.end())
+                    matches.append(PatternMatch(
+                        text=match.group(),
+                        kind=kind,
+                        start=start,
+                        end=end))
+            except Exception as e:
+                self._logger.log(
+                    LogLevel.ERROR,
+                    f"Pattern matching failed for {kind.name}",
+                    error=str(e))
+
+        elapsed = time.perf_counter() - start_time
+        return AnalysisResult(
+            matches=sorted(matches, key=lambda m: m.start.absolute),
+            metrics=AnalysisMetrics(
+                total_matches=len(matches),
+                processing_time=elapsed))
+
+    def _load_patterns(self) -> None:
+        """Load patterns from configuration."""
+        patterns = self._settings.get(
+            "patterns", "default", self.DEFAULT_PATTERNS)
+        self._patterns = {}
+        for name, pattern_str in patterns.items():
+            try:
+                self._patterns[MatchType[name]] = re.compile(
+                    pattern_str, re.MULTILINE | re.DOTALL)
+            except (KeyError, re.error) as e:
+                self._logger.log(
+                    LogLevel.ERROR,
+                    f"Invalid pattern '{name}': {pattern_str}",
+                    error=str(e))
+                if name in self.DEFAULT_PATTERNS:
+                    self._logger.log(
+                        LogLevel.WARNING,
+                        f"Using default pattern for {name}")
+                    self._patterns[MatchType[name]] = re.compile(
+                        self.DEFAULT_PATTERNS[name],
+                        re.MULTILINE | re.DOTALL)
+
+    def _on_patterns_changed(self, key: str, value: Any) -> None:
+        """Handle pattern configuration updates."""
+        self._load_patterns()
+
+    @staticmethod
+    def _calculate_position(text: str, index: int) -> TextPosition:
+        """Calculate line/column position from absolute index."""
+        preceding = text[:index]
+        line = preceding.count('\n') + 1
+        last_newline = preceding.rfind('\n')
+        column = index - last_newline if last_newline != -1 else index + 1
+        return TextPosition(line, column, index)
 
 # endregion
 
 # region Presentation Layer
 
 
-class MatchHighlighter:
-    _COLOR_MAP = {
-        MatchType.TIME: "#FFD700",
-        MatchType.BITCOIN: "#90EE90",
-        MatchType.COMMENT: "#ADD8E6",
+class SyntaxHighlighter:
+    """Advanced syntax highlighting engine."""
+
+    COLOR_SCHEME = {
+        MatchType.TIME: QColor("#f9e2af"),
+        MatchType.BITCOIN: QColor("#a6e3a1"),
+        MatchType.COMMENT: QColor("#74c7ec"),
     }
 
-    def __init__(self, editor: QPlainTextEdit):
-        self.editor = editor
-        self._selections = []
+    def __init__(self, editor: QPlainTextEdit) -> None:
+        self._editor = editor
+        self._selections: List[QTextEdit.ExtraSelection] = []
 
-    def apply_highlights(self, matches: List[PatternMatch]):
+    def apply_highlights(self, matches: List[PatternMatch]) -> None:
+        """Apply highlights to matched patterns."""
         self._selections.clear()
         for match in matches:
-            selection = QTextEdit.ExtraSelection()
-            selection.format = self._get_style(match.type)
-            cursor = self.editor.textCursor()
+            cursor = QTextCursor(self._editor.document())
             cursor.setPosition(match.start.absolute)
             cursor.setPosition(
-                match.end.absolute, QTextCursor.MoveMode.KeepAnchor
-            )
-            selection.cursor = cursor
+                match.end.absolute,
+                QTextCursor.MoveMode.KeepAnchor)
+
+            fmt = QTextCharFormat()
+            fmt.setForeground(self.COLOR_SCHEME[match.kind])
+
+            selection = QTextEdit.ExtraSelection()
+            selection.format = fmt  # type:ignore
+            selection.cursor = cursor  # type:ignore
             self._selections.append(selection)
-        self.editor.setExtraSelections(self._selections)
 
-    def _get_style(self, match_type: MatchType) -> QTextCharFormat:
-        fmt = QTextCharFormat()
-        fmt.setBackground(QColor(self._COLOR_MAP[match_type]))
-        return fmt
+        self._editor.setExtraSelections(self._selections)
 
 
-class CodeEditor(QPlainTextEdit):
-    def __init__(self):
-        super().__init__()
-        self._init_editor_settings()
-        self.highlighter = MatchHighlighter(self)
+class AnalysisResultsView(QTabWidget):
+    """Interactive results visualization component."""
 
-    def _init_editor_settings(self):
-        self.setFont(QFont("Fira Code", 12))
-        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-
-    def highlight_matches(self, matches: List[PatternMatch]):
-        self.highlighter.apply_highlights(matches)
-
-
-class ResultsTable(QTableWidget):
-    def __init__(self, headers: List[str], parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self._init_table(headers)
-
-    def _init_table(self, headers: List[str]):
-        self.setColumnCount(len(headers))
-        self.setHorizontalHeaderLabels(headers)
-        self.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
-        self.verticalHeader().setVisible(False)
-        self.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-
-    def update_data(self, data: List[List[Any]]):
-        self.setRowCount(len(data))
-        for row, items in enumerate(data):
-            for col, item in enumerate(items):
-                self.setItem(row, col, QTableWidgetItem(str(item)))
-
-
-class ResultsPresenter(QTabWidget):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self._init_ui()
 
-    def _init_ui(self):
-        self.match_table = ResultsTable([
-            "Type", "Text", "Line", "Column", "Position"
-        ])
-        self.addTab(self.match_table, "Matches")
+    def _init_ui(self) -> None:
+        """Initialize UI components."""
+        self._table = QTableWidget()
+        self._table.setColumnCount(5)
+        self._table.setHorizontalHeaderLabels(["Тип", "Текст", "Строка", "Столбец", "Диапазон"])
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.addTab(self._table, "Совпадения")
 
-    def display_analysis(self, result: AnalysisResult):
-        self.match_table.update_data([
-            [
-                match.type.value,
-                match.text,
-                match.start.line,
-                match.start.column,
-                f"{match.start.absolute}-{match.end.absolute}",
-            ]
-            for match in result.matches
-        ])
+    def update_results(self, result: AnalysisResult) -> None:
+        """Update display with new analysis results."""
+        self._table.setRowCount(len(result.matches))
+        for row, match in enumerate(result.matches):
+            self._table.setItem(row, 0, QTableWidgetItem(match.kind.name))
+            self._table.setItem(row, 1, QTableWidgetItem(match.text))
+            self._table.setItem(row, 2, QTableWidgetItem(str(match.start.line)))
+            self._table.setItem(row, 3, QTableWidgetItem(str(match.start.column)))
+            self._table.setItem(row, 4, QTableWidgetItem(f"{match.start.absolute}-{match.end.absolute}"))
 
+# endregion
+
+# region Configuration
+
+
+class SettingsManager(QSettings):
+    """Advanced configuration management system."""
+
+    setting_changed = Signal(str, str, object)
+
+    def __init__(self) -> None:
+        super().__init__("TextAnalyzerPro", "Settings")
+        self._handlers: DefaultDict[str, List[Callable[[str, Any], None]]] = defaultdict(list)
+
+    def get(self, section: str, key: str, default: Any = None) -> Any:
+        return self.value(f"{section}/{key}", default)
+
+    def set(self, section: str, key: str, value: Any) -> None:
+        self.setValue(f"{section}/{key}", value)
+        self.setting_changed.emit(section, key, value)
+        self._notify_handlers(section, key, value)
+
+    def register_handler(self, section: str,
+                         handler: Callable[[str, Any], None]) -> None:
+        self._handlers[section].append(handler)
+
+    def _notify_handlers(self, section: str, key: str, value: Any) -> None:
+        for handler in self._handlers.get(section, []):
+            handler(key, value)
+
+
+class SettingsDialog(QDialog):
+    """Configuration dialog for application settings."""
+
+    def __init__(self, settings: ISettingsManager):
+        super().__init__()
+        self._settings = settings
+        self._init_ui()
+
+    def _init_ui(self) -> None:
+        """Initialize dialog components."""
+        self.setWindowTitle("Настройки")
+        layout = QFormLayout(self)
+
+        # Pattern settings
+        self.pattern_edits = {}
+        default_patterns = RegexAnalyzer.DEFAULT_PATTERNS
+        patterns = self._settings.get("patterns", "default", default_patterns)
+        for name in MatchType.__members__:
+            edit = QLineEdit(patterns.get(name, ""))
+            self.pattern_edits[name] = edit
+            layout.addRow(f"{name} Pattern:", edit)
+
+        # UI settings
+        self.font_spin = QSpinBox()
+        self.font_spin.setValue(int(self._settings.get("ui", "font_size", 12)))
+        layout.addRow("Font Size:", self.font_spin)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                   QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._save_settings)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def _save_settings(self) -> None:
+        """Save updated settings to configuration."""
+        new_patterns = {name: edit.text() for name, edit in self.pattern_edits.items()}
+        self._settings.set("patterns", "default", new_patterns)
+        self._settings.set("ui", "font_size", self.font_spin.value())
+        self.accept()
 
 # endregion
 
@@ -377,247 +608,267 @@ class ResultsPresenter(QTabWidget):
 
 
 class ApplicationModel(QObject):
-    code_updated = Signal(str)
+    """Central data model for application state."""
+
+    content_changed = Signal(str)
     analysis_completed = Signal(AnalysisResult)
 
-    def __init__(self, parent: Optional[QObject] = None):
-        super().__init__(parent)
-        self._code = ""
+    def __init__(self) -> None:
+        super().__init__()
+        self._content = ""
         self._last_result: Optional[AnalysisResult] = None
 
     @property
-    def code(self) -> str:
-        return self._code
+    def content(self) -> str:
+        return self._content
 
-    @code.setter
-    def code(self, value: str):
-        if self._code != value:
-            self._code = value
-            self.code_updated.emit(value)
+    @content.setter
+    def content(self, value: str) -> None:
+        if value != self._content:
+            self._content = value
+            self.content_changed.emit(value)
 
-    def update_analysis(self, result: AnalysisResult):
+    def update_result(self, result: AnalysisResult) -> None:
         self._last_result = result
         self.analysis_completed.emit(result)
 
 
 class ApplicationController(QObject):
-    analyze_requested = Signal()
-    file_open_requested = Signal(Path)
-    file_save_requested = Signal(Path)
-    application_exit = Signal()
+    """Orchestrates application workflow and business logic."""
 
     def __init__(
         self,
         model: ApplicationModel,
-        file_handler: FileHandler,
-        analyzer: TextAnalyzer,
-        logger: Logger,
-    ):
+        view: IView,
+        file_handler: IFileHandler,
+        analyzer: ITextAnalyzer,
+        logger: ILogger,
+        settings: ISettingsManager
+    ) -> None:
         super().__init__()
-        self.model = model
-        self.file_handler = file_handler
-        self.analyzer = analyzer
-        self.logger = logger
+        self._model = model
+        self._view = view
+        self._file_handler = file_handler
+        self._analyzer = analyzer
+        self._logger = logger
+        self._settings = settings
+
         self._connect_signals()
+        self._register_settings_handlers()
 
-    def _connect_signals(self):
-        self.model.analysis_completed.connect(self._handle_analysis_result)
-        self.analyze_requested.connect(self._perform_analysis)
-        self.file_open_requested.connect(self._handle_file_open)
-        self.file_save_requested.connect(self._handle_file_save)
+    def _connect_signals(self) -> None:
+        """Connect component signals to controller slots."""
+        self._view.content_changed.connect(self._on_content_changed)
+        self._view.file_open_requested.connect(self._handle_file_open)
+        self._model.analysis_completed.connect(self._on_analysis_completed)
 
-    @Slot(Path)
-    def _handle_file_open(self, path: Path):
+    def _register_settings_handlers(self) -> None:
+        """Register configuration change handlers."""
+        self._settings.register_handler("ui", self._handle_ui_changes)
+
+    @Slot(str)
+    def _on_content_changed(self, content: str) -> None:
+        """Handle text content changes from editor."""
         try:
-            self.model.code = self.file_handler.read(path)
-        except FileOperationError as e:
-            full_error = f"File operation failed: {str(e)}\nPath: {path}"
-            self.logger.log(
+            result = self._analyzer.analyze(content)
+            self._model.update_result(result)
+        except Exception as e:
+            self._logger.log(
                 LogLevel.ERROR,
-                full_error,
-                {"path": str(path), "error": str(e)}
-            )
-            self._show_error(
+                "Analysis failed",
+                error=str(e),
+                traceback=traceback.format_exc())
+
+    @Slot(str)
+    def _handle_file_open(self, path: str) -> None:
+        """Handle file open requests."""
+        try:
+            content = self._file_handler.read(Path(path))
+            self._model.content = content
+        except Exception as e:
+            self._logger.log(
+                LogLevel.ERROR,
+                "File open failed",
+                path=path,
+                error=str(e))
+            QMessageBox.critical(
+                self._view,
                 "File Error",
-                f"Failed to process file:\n{path.name}\n\nDetails: {str(e)}"
-            )
-
-    @Slot(Path)
-    def _handle_file_save(self, path: Path):
-        try:
-            self.file_handler.write(path, self.model.code)
-        except FileOperationError as e:
-            self.logger.log(LogLevel.ERROR, str(e))
-            self._show_error("File Save Error", str(e))
-
-    @Slot()
-    def _perform_analysis(self):
-        try:
-            result = self.analyzer.analyze(self.model.code)
-            self.model.update_analysis(result)
-        except AnalysisFailure as e:
-            error_msg = f"Analysis failure: {str(e)}"
-            self.logger.log(
-                LogLevel.ERROR,
-                error_msg,
-                {"error": str(e), "stack_trace": traceback.format_exc()}
-            )
-            self._show_error("Analysis Error", error_msg)
+                f"Failed to open file: {e}")
 
     @Slot(AnalysisResult)
-    def _handle_analysis_result(self, result: AnalysisResult):
-        self.logger.log(
-            LogLevel.INFO,
-            "Analysis completed",
-            {"matches": len(result.matches)},
-        )
+    def _on_analysis_completed(self, result: AnalysisResult) -> None:
+        """Update view with analysis results."""
+        self._view.display_results(result)
 
-    def _show_error(self, title: str, message: str):
-        QMessageBox.critical(
-            None,
-            title,
-            message,
-            QMessageBox.StandardButton.Ok,
-        )
+    def _handle_ui_changes(self, key: str, value: Any) -> None:
+        """Update UI components based on settings changes."""
+        if key == "theme":
+            self._apply_theme(value)
+        elif key == "font_size":
+            self._adjust_font_size(value)
 
-    def _show_warning(self, title: str, message: str):
-        QMessageBox.warning(
-            None,
-            title,
-            message,
-            QMessageBox.StandardButton.Ok,
-        )
+    def _apply_theme(self, theme: str) -> None:
+        """Apply visual theme to UI components."""
+        self._logger.log(LogLevel.INFO, f"Theme changed to {theme}")
 
+    def _adjust_font_size(self, size: int) -> None:
+        """Adjust UI font sizes."""
+        self._logger.log(LogLevel.INFO, f"Font size changed to {size}")
 
 # endregion
 
-# region UI Layer
+# region Main Window
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, controller: ApplicationController):
+    """Primary application window implementing IView."""
+
+    content_changed = Signal(str)
+    file_open_requested = Signal(str)
+
+    def __init__(self, theme_manager: ThemeManager, settings: ISettingsManager, logger: ILogger):
         super().__init__()
-        self.controller = controller
+        self._theme_manager = theme_manager
+        self._theme_manager.theme_changed.connect(self._on_theme_changed)
+        self._settings = settings
+        self._logger = logger
+        self._editor = QPlainTextEdit()
+        self._results_view = AnalysisResultsView()
+        self._highlighter = SyntaxHighlighter(self._editor)
         self._init_ui()
-        self._setup_menu()
-        self._connect_signals()
+        self._create_menu()
 
-    def _init_ui(self):
-        self.setWindowTitle("Text Analyzer Pro")
-        self.editor = CodeEditor()
-        self.results = ResultsPresenter()
-
-        layout = QVBoxLayout()
-        layout.addWidget(self.editor, 70)
-        layout.addWidget(self.results, 30)
-
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
+    def _init_ui(self) -> None:
+        """Initialize window layout and components."""
+        self.setWindowTitle("Анализатор")
         self.resize(1280, 720)
 
-    def _setup_menu(self):
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.addWidget(self._editor, 70)
+        layout.addWidget(self._results_view, 30)
+        self.setCentralWidget(container)
+
+        self._editor.textChanged.connect(
+            lambda: self.content_changed.emit(self._editor.toPlainText()))
+
+    def _create_menu(self) -> None:
+        """Create application menu system."""
         menubar = self.menuBar()
 
         # File menu
-        file_menu = menubar.addMenu("&File")
-        open_action = QAction("&Open...", self)
-        open_action.triggered.connect(self._handle_open)
+        file_menu = menubar.addMenu("&Файл")
+        open_action = QAction("&Открыть", self)
+        open_action.triggered.connect(self._open_file)
         file_menu.addAction(open_action)
 
-        save_action = QAction("&Save As...", self)
-        save_action.triggered.connect(self._handle_save)
-        file_menu.addAction(save_action)
+        # Settings menu
+        settings_menu = menubar.addMenu("&Настройка")
+        config_action = QAction("&Конфигурация", self)
+        config_action.triggered.connect(self._show_settings)
+        settings_menu.addAction(config_action)
 
-        file_menu.addSeparator()
-        exit_action = QAction("&Exit", self)
-        exit_action.triggered.connect(self.close)
-        file_menu.addAction(exit_action)
-
-        # Analysis menu
-        analysis_menu = menubar.addMenu("&Analysis")
-        analyze_action = QAction("&Run Analysis", self)
-        analyze_action.triggered.connect(self.controller.analyze_requested)
-        analysis_menu.addAction(analyze_action)
-
-    def _connect_signals(self):
-        self.editor.textChanged.connect(self._update_model_code)
-        self.controller.model.analysis_completed.connect(
-            self._handle_analysis_result
-        )
-
-    def _update_model_code(self):
-        self.controller.model.code = self.editor.toPlainText()
-
-    def _handle_analysis_result(self, result: AnalysisResult):
-        self.editor.highlight_matches(result.matches)
-        self.results.display_analysis(result)
-
-    def _handle_open(self):
+    def _open_file(self) -> None:
+        """Handle file open action."""
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Open Text File",
             "",
-            "Text Files (*.txt);;All Files (*)",
-        )
+            "Text Files (*.txt *.log *.csv);;All Files (*)")
         if path:
-            self.controller.file_open_requested.emit(Path(path))
+            self.file_open_requested.emit(path)
 
-    def _handle_save(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Text File",
-            "",
-            "Text Files (*.txt);;All Files (*)",
-        )
-        if path:
-            self.controller.file_save_requested.emit(Path(path))
+    def _show_settings(self) -> None:
+        """Display settings dialog."""
+        dialog = SettingsDialog(self._settings)
+        if dialog.exec():
+            self._logger.log(LogLevel.INFO, "Settings updated")
 
-    def closeEvent(self, event: QCloseEvent):
-        self.controller.application_exit.emit()
-        super().closeEvent(event)
+    def display_results(self, result: AnalysisResult) -> None:
+        """Update UI with analysis results."""
+        self._results_view.update_results(result)
+        self._highlighter.apply_highlights(result.matches)
 
+    @Slot(ITheme)
+    def _on_theme_changed(self, theme: ITheme) -> None:
+        """Update theme-dependent components"""
+        self._update_syntax_highlighting(theme.colors)
+
+    def _update_syntax_highlighting(self, colors: Dict[str, QColor]) -> None:
+        self._highlighter.COLOR_SCHEME = {
+            MatchType.TIME: colors["yellow"],
+            MatchType.BITCOIN: colors["green"],
+            MatchType.COMMENT: colors["blue"],
+        }
+
+    def set_content(self, text: str) -> None:
+        """Set editor content."""
+        self._editor.setPlainText(text)
+
+    def show(self) -> None:
+        """Show main window."""
+        super().show()
 
 # endregion
 
-# region Factory
+# region Application Bootstrap
 
 
-class ApplicationFactory:
-    @staticmethod
-    def create() -> Tuple[MainWindow, ApplicationController]:
-        logger = AdvancedLogger()
-        file_handler = SecureFileHandler(logger)
-        analyzer = RegexAnalyzer(logger)
-        model = ApplicationModel()
-        controller = ApplicationController(
-            model=model,
-            file_handler=file_handler,
-            analyzer=analyzer,
-            logger=logger,
+class TextAnalyzerApp(QApplication):
+    """Custom application container with lifecycle management."""
+
+    def __init__(self, args: List[str]) -> None:
+        super().__init__(args)
+
+        # Initialize core services first
+        self.settings = SettingsManager()
+        self.logger = StructuredLogger()
+
+        # Setup theme management
+        self._theme_manager = ThemeManager(self.settings)
+        self._theme_manager.register_theme(CatppuccinDarkTheme())
+
+        # Apply stored theme
+        theme_name = self.settings.get("ui", "theme", "catppuccin-dark")
+        self._theme_manager.set_theme(theme_name)
+
+        # Initialize remaining components
+        self.file_handler = SecureFileHandler(self.logger)
+        self.analyzer = RegexAnalyzer(self.logger, self.settings)
+        self.model = ApplicationModel()
+        self.view = MainWindow(self._theme_manager, self.settings, self.logger)
+        self.controller = ApplicationController(
+            self.model,
+            self.view,
+            self.file_handler,
+            self.analyzer,
+            self.logger,
+            self.settings
         )
-        window = MainWindow(controller)
-        if app := QApplication.instance():
-            controller.application_exit.connect(app.quit)
-        return window, controller
+
+        # Apply theme to application instance
+        self._theme_manager.current_theme().apply(self)
 
 
-# endregion
-
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    main_window: Optional[QWidget] = None
-
+def main() -> None:
+    """Application entry point with error handling."""
     try:
-        window, _ = ApplicationFactory.create()
-        main_window = window
-        window.show()
+        app = TextAnalyzerApp(sys.argv)
+        app.view.show()
         sys.exit(app.exec())
     except Exception as e:
+        logging.critical(f"Fatal initialization error: {e}", exc_info=True)
+        parent = QApplication.activeWindow()
         QMessageBox.critical(
-            main_window or QWidget(),
+            parent,
             "Critical Error",
-            f"Application failed to start:\n{str(e)}",
-            QMessageBox.StandardButton.Ok,
-        )
+            f"Application failed to start: {str(e)}",
+            QMessageBox.StandardButton.Ok)
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+# endregion
